@@ -53,6 +53,8 @@ struct TrafficData {
     sensor_id: String,
     timestamp: DateTime<Utc>,
     location_id: String,
+    location_x: f32,
+    location_y: f32,
     density: u16,
     travel_time: u16,
     vehicle_number: u16,
@@ -136,6 +138,8 @@ struct QueueLengthByLane {
 struct TrafficSimulator {
     sensor_id: String,
     location_id: String,
+    location_x: f32,
+    location_y: f32,
     intersection_id: String,
     producer: FutureProducer,
     start_time: Instant,
@@ -149,6 +153,8 @@ impl TrafficSimulator {
     fn new(
         sensor_id: &str,
         location_id: &str,
+        location_x: f32,
+        location_y: f32,
         intersection_id: &str,
         kafka_brokers: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
@@ -161,6 +167,8 @@ impl TrafficSimulator {
         Ok(TrafficSimulator {
             sensor_id: sensor_id.to_string(),
             location_id: location_id.to_string(),
+            location_x,
+            location_y,
             intersection_id: intersection_id.to_string(),
             producer,
             start_time: Instant::now(),
@@ -430,6 +438,8 @@ impl TrafficSimulator {
             sensor_id: self.sensor_id.clone(),
             timestamp: Utc::now(),
             location_id: self.location_id.clone(),
+            location_x: self.location_x,
+            location_y: self.location_y,
             density,
             travel_time,
             vehicle_number,
@@ -674,16 +684,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sensor_configs = vec![
         (
             "sensor-001",
-            "location-main-road",
-            "intersection-downtown",
-            500,
+            "bd-zerktouni-n",
+            33.5912,
+            -7.6361,
+            "bd-anfa-bd-zerktouni",
+            750,
         ),
-        ("sensor-002", "location-highway", "intersection-north", 750),
+        (
+            "sensor-002",
+            "bd-zerktouni-s",
+            33.5907,
+            -7.6357,
+            "bd-anfa-bd-zerktouni",
+            750,
+        ),
         (
             "sensor-003",
-            "location-residential",
-            "intersection-east",
-            1200,
+            "bd-anfa-e",
+            33.5912,
+            -7.6356,
+            "bd-anfa-bd-zerktouni",
+            750,
+        ),
+        (
+            "sensor-004",
+            "bd-anfa-w",
+            33.5909,
+            -7.6363,
+            "bd-anfa-bd-zerktouni",
+            750,
         ),
     ];
 
@@ -696,10 +725,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut tasks = vec![];
 
-    for (sensor_id, location_id, intersection_id, interval_ms) in sensor_configs {
+    for (sensor_id, location_id, location_x, location_y, intersection_id, interval_ms) in
+        sensor_configs
+    {
         let simulator = Arc::new(Mutex::new(TrafficSimulator::new(
             sensor_id,
             location_id,
+            location_x,
+            location_y,
             intersection_id,
             kafka_brokers,
         )?));
@@ -787,4 +820,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
