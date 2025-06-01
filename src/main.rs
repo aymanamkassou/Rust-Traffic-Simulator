@@ -18,6 +18,7 @@ use std::{
 };
 use tokio::{sync::Mutex, time};
 use uuid::Uuid;
+use std::collections::HashMap;
 
 // ===== Intersection Controller Structures =====
 
@@ -29,6 +30,11 @@ pub struct IntersectionController {
     shared_weather_state: WeatherState,
     base_traffic_density: f32,
     vehicle_flow_tracker: VehicleFlowTracker,
+    // NEW FIELDS for realistic weather
+    last_weather_update: Instant,
+    weather_change_interval_minutes: u64, // Weather changes every 15-30 minutes
+    weather_transition_target: Option<WeatherState>, // Target weather for gradual transition
+    weather_transition_progress: f32, // 0.0 to 1.0
 }
 
 #[derive(Debug, Clone)]
@@ -227,51 +233,157 @@ impl IntersectionController {
                 flow_rates: std::collections::HashMap::new(),
                 queue_propagation: std::collections::HashMap::new(),
             },
+            // NEW FIELDS for realistic weather
+            last_weather_update: Instant::now(),
+            weather_change_interval_minutes: 15, // Weather changes every 15-30 minutes
+            weather_transition_target: None, // Target weather for gradual transition
+            weather_transition_progress: 0.0, // 0.0 to 1.0
         }
     }
 
     fn update_shared_weather(&mut self) {
-        // Generate weather once for entire intersection
+        // Check if it's time for a weather change (every 15-30 minutes)
+        let elapsed_minutes = self.last_weather_update.elapsed().as_secs() / 60;
+        
+        // Only consider weather changes every 15-30 minutes
+        if elapsed_minutes >= self.weather_change_interval_minutes {
+            // Decide if weather should change (only 30% chance)
+            let mut rng = rand::thread_rng();
+            if rng.gen_bool(0.3) {
+                self.initiate_weather_transition();
+                self.last_weather_update = Instant::now();
+                // Set next interval (15-30 minutes)
+                self.weather_change_interval_minutes = rng.gen_range(15..=30);
+            }
+        }
+        
+        // Apply gradual weather transitions if in progress
+        self.apply_weather_transition();
+    }
+    
+    fn initiate_weather_transition(&mut self) {
         let hour = Utc::now().hour();
         let month = Utc::now().month();
-        
-        // Seasonal weather patterns
-        let weather_options = ["sunny", "rain", "snow", "fog"];
-        let weather_weights = match month {
-            12 | 1 | 2 => vec![40, 20, 35, 5], // Winter - more snow
-            3 | 4 | 5 => vec![50, 40, 5, 5],   // Spring - more rain
-            6 | 7 | 8 => vec![80, 15, 0, 5],   // Summer - mostly sunny
-            _ => vec![60, 30, 5, 5],           // Fall - mixed
-        };
-        
         let mut rng = rand::thread_rng();
-        let conditions = weighted_choice(&weather_options, &weather_weights, &mut rng);
         
-        // Temperature based on season
-        let temperature = match month {
-            12 | 1 | 2 => rng.gen_range(-10.0..5.0), // Winter
-            3 | 4 | 5 => rng.gen_range(5.0..20.0),   // Spring
-            6 | 7 | 8 => rng.gen_range(20.0..35.0),  // Summer
-            _ => rng.gen_range(5.0..25.0),           // Fall
+        // Generate target weather based on current conditions and realistic transitions
+        let current_conditions = &self.shared_weather_state.conditions;
+        
+        // Realistic weather transitions (weather doesn't jump from sunny to snow)
+        let possible_transitions = match current_conditions.as_str() {
+            "sunny" => vec!["cloudy", "partly_cloudy"],
+            "partly_cloudy" => vec!["sunny", "cloudy", "overcast"],
+            "cloudy" => vec!["partly_cloudy", "overcast", "light_rain"],
+            "overcast" => vec!["cloudy", "light_rain", "fog"],
+            "light_rain" => vec!["overcast", "rain", "cloudy"],
+            "rain" => vec!["light_rain", "overcast", "heavy_rain"],
+            "heavy_rain" => vec!["rain", "storm"],
+            "storm" => vec!["heavy_rain", "rain"],
+            "fog" => vec!["overcast", "cloudy"],
+            "snow" => vec!["overcast", "light_snow"],
+            "light_snow" => vec!["snow", "overcast"],
+            _ => vec!["sunny", "cloudy"],
         };
         
-        // Road condition correlates with weather
-        let road_condition = match conditions {
-            "sunny" => "dry",
-            "rain" => "wet",
-            "snow" => if rng.gen_bool(0.7) { "icy" } else { "wet" },
-            "fog" => if rng.gen_bool(0.3) { "wet" } else { "dry" },
-            _ => "dry",
+        // Add seasonal weather bias
+        let seasonal_weather = match month {
+            12 | 1 | 2 => vec!["snow", "light_snow", "overcast"], // Winter
+            3 | 4 | 5 => vec!["light_rain", "rain", "cloudy"],    // Spring  
+            6 | 7 | 8 => vec!["sunny", "partly_cloudy"],          // Summer
+            _ => vec!["overcast", "cloudy", "light_rain"],        // Fall
         };
         
-        self.shared_weather_state = WeatherState {
-            conditions: conditions.to_string(),
-            temperature,
-            humidity: rng.gen_range(0..100),
-            wind_speed: rng.gen_range(0..40),
-            visibility: if conditions == "fog" { "poor" } else { "good" }.to_string(),
-            road_condition: road_condition.to_string(),
+        // Combine current transitions with seasonal bias
+        let mut weighted_options = possible_transitions.clone();
+        weighted_options.extend(seasonal_weather);
+        
+        let target_conditions = weighted_options.choose(&mut rng).unwrap_or(&"sunny").to_string();
+        
+        // Calculate realistic target temperature (gradual change)
+        let current_temp = self.shared_weather_state.temperature;
+        let temp_change = rng.gen_range(-3.0..=3.0); // Max 3°C change
+        let mut target_temp = current_temp + temp_change;
+        
+        // Apply seasonal temperature constraints
+        let (min_temp, max_temp) = match month {
+            12 | 1 | 2 => (-15.0, 10.0),  // Winter
+            3 | 4 | 5 => (0.0, 25.0),     // Spring
+            6 | 7 | 8 => (15.0, 40.0),    // Summer
+            _ => (5.0, 30.0),             // Fall
         };
+        target_temp = target_temp.clamp(min_temp, max_temp);
+        
+        // Calculate realistic humidity change
+        let current_humidity = self.shared_weather_state.humidity;
+        let humidity_change = rng.gen_range(-10..=10);
+        let target_humidity = (current_humidity as i16 + humidity_change).clamp(20, 95) as u16;
+        
+        // Calculate realistic wind speed change
+        let current_wind = self.shared_weather_state.wind_speed;
+        let wind_change = rng.gen_range(-5..=5);
+        let target_wind = (current_wind as i16 + wind_change).clamp(0, 50) as u16;
+        
+        // Set visibility and road condition based on target weather
+        let (target_visibility, target_road_condition) = match target_conditions.as_str() {
+            "fog" => ("poor", "wet"),
+            "rain" | "heavy_rain" | "storm" => ("fair", "wet"),
+            "light_rain" => ("good", "wet"),
+            "snow" | "light_snow" => ("poor", if rng.gen_bool(0.8) { "icy" } else { "wet" }),
+            _ => ("good", "dry"),
+        };
+        
+        self.weather_transition_target = Some(WeatherState {
+            conditions: target_conditions,
+            temperature: target_temp,
+            humidity: target_humidity,
+            wind_speed: target_wind,
+            visibility: target_visibility.to_string(),
+            road_condition: target_road_condition.to_string(),
+        });
+        
+        self.weather_transition_progress = 0.0;
+    }
+    
+    fn apply_weather_transition(&mut self) {
+        if let Some(target) = &self.weather_transition_target {
+            // Transition happens over 10 minutes (600 seconds)
+            let transition_duration_seconds = 600.0;
+            let progress_increment = 1.0 / transition_duration_seconds; // Per second
+            
+            self.weather_transition_progress += progress_increment;
+            
+            if self.weather_transition_progress >= 1.0 {
+                // Transition complete
+                self.shared_weather_state = target.clone();
+                self.weather_transition_target = None;
+                self.weather_transition_progress = 0.0;
+            } else {
+                // Interpolate between current and target weather
+                let progress = self.weather_transition_progress;
+                
+                // Interpolate temperature
+                let current_temp = self.shared_weather_state.temperature;
+                let target_temp = target.temperature;
+                self.shared_weather_state.temperature = current_temp + (target_temp - current_temp) * progress;
+                
+                // Interpolate humidity
+                let current_humidity = self.shared_weather_state.humidity as f32;
+                let target_humidity = target.humidity as f32;
+                self.shared_weather_state.humidity = (current_humidity + (target_humidity - current_humidity) * progress) as u16;
+                
+                // Interpolate wind speed
+                let current_wind = self.shared_weather_state.wind_speed as f32;
+                let target_wind = target.wind_speed as f32;
+                self.shared_weather_state.wind_speed = (current_wind + (target_wind - current_wind) * progress) as u16;
+                
+                // Switch discrete values at 50% progress
+                if progress >= 0.5 {
+                    self.shared_weather_state.conditions = target.conditions.clone();
+                    self.shared_weather_state.visibility = target.visibility.clone();
+                    self.shared_weather_state.road_condition = target.road_condition.clone();
+                }
+            }
+        }
     }
     
     fn get_weather_for_sensor(&self, _sensor_id: &str) -> WeatherState {
@@ -1259,46 +1371,73 @@ impl TrafficSimulator {
 // ===== Main Application =====
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Create intersection controller
-    let intersection_controller = Arc::new(Mutex::new(IntersectionController::new(
+    // Create multiple intersection controllers for different areas
+    let bd_anfa_controller = Arc::new(Mutex::new(IntersectionController::new(
         "bd-anfa-bd-zerktouni".to_string(),
         vec!["sensor-001".to_string(), "sensor-002".to_string(), "sensor-003".to_string(), "sensor-004".to_string()]
     )));
+    
+    let hassan_ii_controller = Arc::new(Mutex::new(IntersectionController::new(
+        "hassan-ii-bd-moulay-youssef".to_string(),
+        vec!["sensor-005".to_string(), "sensor-006".to_string(), "sensor-007".to_string(), "sensor-008".to_string()]
+    )));
 
-    // Update sensor configs to include direction
+    // Expanded sensor configs with 8 sensors across 2 intersections
     let sensor_configs = vec![
-        ("sensor-001", "bd-zerktouni-n", 33.5912, -7.6361, "bd-anfa-bd-zerktouni", "north", 750),
-        ("sensor-002", "bd-zerktouni-s", 33.5907, -7.6357, "bd-anfa-bd-zerktouni", "south", 750),  
-        ("sensor-003", "bd-anfa-e", 33.5912, -7.6356, "bd-anfa-bd-zerktouni", "east", 750),
-        ("sensor-004", "bd-anfa-w", 33.5909, -7.6363, "bd-anfa-bd-zerktouni", "west", 750),
+        // Existing BD Anfa - BD Zerktouni Intersection
+        ("sensor-001", "bd-zerktouni-n", 33.5912, -7.6361, "bd-anfa-bd-zerktouni", "north", 750, bd_anfa_controller.clone()),
+        ("sensor-002", "bd-zerktouni-s", 33.5907, -7.6357, "bd-anfa-bd-zerktouni", "south", 750, bd_anfa_controller.clone()),  
+        ("sensor-003", "bd-anfa-e", 33.5912, -7.6356, "bd-anfa-bd-zerktouni", "east", 750, bd_anfa_controller.clone()),
+        ("sensor-004", "bd-anfa-w", 33.5909, -7.6363, "bd-anfa-bd-zerktouni", "west", 750, bd_anfa_controller.clone()),
+        
+        // NEW Hassan II - Boulevard Moulay Youssef Intersection (2km northeast)
+        ("sensor-005", "hassan-ii-n", 33.6045, -7.6142, "hassan-ii-bd-moulay-youssef", "north", 850, hassan_ii_controller.clone()),
+        ("sensor-006", "hassan-ii-s", 33.6038, -7.6139, "hassan-ii-bd-moulay-youssef", "south", 850, hassan_ii_controller.clone()),
+        ("sensor-007", "bd-moulay-youssef-e", 33.6042, -7.6135, "hassan-ii-bd-moulay-youssef", "east", 850, hassan_ii_controller.clone()),
+        ("sensor-008", "bd-moulay-youssef-w", 33.6040, -7.6146, "hassan-ii-bd-moulay-youssef", "west", 850, hassan_ii_controller.clone()),
     ];
 
     let kafka_brokers = "localhost:9092";
     let periodic_update_interval_s = 60;
 
-    println!("Starting Traffic Sensor Simulator with Intersection Controller");
-    println!("Kafka broker: {}", kafka_brokers);
-    println!("Sensor count: {}", sensor_configs.len());
-    println!("Intersection: bd-anfa-bd-zerktouni with coordinated traffic lights and weather");
+    println!("🚀 Starting Enhanced Traffic Sensor Simulator with Multiple Intersection Controllers");
+    println!("📡 Kafka broker: {}", kafka_brokers);
+    println!("🎯 Sensor count: {}", sensor_configs.len());
+    println!("🌦️  Realistic weather: 15-30 minute gradual transitions");
+    println!("🚦 Intersections:");
+    println!("   • BD Anfa ↔ BD Zerktouni (sensors 001-004)");
+    println!("   • Hassan II ↔ BD Moulay Youssef (sensors 005-008)");
 
     let mut tasks = vec![];
 
-    // Create intersection controller update task
-    let controller_clone = intersection_controller.clone();
-    let controller_task = tokio::spawn(async move {
+    // Create intersection controller update tasks for each intersection
+    let bd_anfa_task = tokio::spawn(async move {
         let mut interval = time::interval(Duration::from_secs(1)); // Update every second
 
         loop {
             interval.tick().await;
 
-            let mut controller = controller_clone.lock().await;
+            let mut controller = bd_anfa_controller.lock().await;
             controller.update_traffic_lights();
-            controller.update_shared_weather();
+            controller.update_shared_weather(); // Now realistic gradual changes
         }
     });
-    tasks.push(controller_task);
+    tasks.push(bd_anfa_task);
 
-    for (sensor_id, location_id, location_x, location_y, intersection_id, sensor_direction, interval_ms) in
+    let hassan_ii_task = tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(1)); // Update every second
+
+        loop {
+            interval.tick().await;
+
+            let mut controller = hassan_ii_controller.lock().await;
+            controller.update_traffic_lights();
+            controller.update_shared_weather(); // Independent weather for different area
+        }
+    });
+    tasks.push(hassan_ii_task);
+
+    for (sensor_id, location_id, location_x, location_y, intersection_id, sensor_direction, interval_ms, controller_ref) in
         sensor_configs
     {
         let simulator = Arc::new(Mutex::new(TrafficSimulator::new(
@@ -1310,9 +1449,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sensor_direction,
             kafka_brokers,
         )?));
-
-        // Pass intersection controller to simulator tasks
-        let controller_ref = intersection_controller.clone();
 
         // Task for vehicle data generation
         let sim_clone = simulator.clone();
@@ -1326,7 +1462,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut sim = sim_clone.lock().await;
                 match sim.generate_vehicle_data().await {
                     Ok(_) => {}
-                    Err(e) => eprintln!("Error generating vehicle data: {}", e),
+                    Err(e) => eprintln!("❌ Error generating vehicle data for {}: {}", sim.sensor_id, e),
                 }
             }
         });
@@ -1354,7 +1490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 
                 match sim.generate_traffic_data_with_controller(controller_clone.clone()).await {
                     Ok(_) => {}
-                    Err(e) => eprintln!("Error generating traffic data: {}", e),
+                    Err(e) => eprintln!("❌ Error generating traffic data for {}: {}", sim.sensor_id, e),
                 }
             }
         });
@@ -1372,7 +1508,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut sim = sim_clone.lock().await;
                 match sim.generate_intersection_data_with_controller(controller_clone.clone()).await {
                     Ok(_) => {}
-                    Err(e) => eprintln!("Error generating intersection data: {}", e),
+                    Err(e) => eprintln!("❌ Error generating intersection data for {}: {}", sim.sensor_id, e),
                 }
             }
         });
@@ -1387,20 +1523,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
 
-                println!("Sending health data for sensor {}", sensor_id_str);
+                println!("📊 Sending health data for sensor {}", sensor_id_str);
 
                 let mut sim = sim_clone.lock().await;
                 match sim.send_health_data().await {
                     Ok(_) => {}
-                    Err(e) => eprintln!("Error sending health data: {}", e),
+                    Err(e) => eprintln!("❌ Error sending health data for {}: {}", sensor_id_str, e),
                 }
             }
         });
         tasks.push(health_task);
 
         println!(
-            "Started simulator for sensor {} ({}) with interval {}ms",
-            sensor_id, sensor_direction, interval_ms
+            "✅ Started simulator for sensor {} ({}) at {} with {}ms interval",
+            sensor_id, sensor_direction, intersection_id, interval_ms
         );
     }
 
