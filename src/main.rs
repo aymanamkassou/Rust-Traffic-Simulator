@@ -436,8 +436,25 @@ impl IntersectionController {
     }
     
     fn update_vehicle_flow(&mut self, sensor_id: &str, vehicle_count: u16, density: u16) {
-        // Calculate vehicles per minute flow rate
-        let flow_rate = vehicle_count as f32 * 12.0; // Assuming 5-second updates, so *12 for per minute
+        // 🚀 FIXED: More realistic flow rate calculation
+        // Convert vehicle count to realistic vehicles per minute flow rate
+        
+        // Base flow rate should correlate with vehicle count but be realistic
+        // For midnight: 5-25 vehicles should give 10-50 vehicles/min flow
+        // For rush hour: 60-90 vehicles should give 60-120 vehicles/min flow
+        let base_flow_rate = match vehicle_count {
+            0..=10 => vehicle_count as f32 * 2.0,     // Low traffic: 0-20 vehicles/min
+            11..=30 => vehicle_count as f32 * 1.8,    // Light traffic: 20-54 vehicles/min  
+            31..=60 => vehicle_count as f32 * 1.5,    // Medium traffic: 47-90 vehicles/min
+            61..=90 => vehicle_count as f32 * 1.3,    // High traffic: 79-117 vehicles/min
+            _ => vehicle_count as f32 * 1.1,          // Heavy traffic: capped growth
+        };
+        
+        // Add some realistic variance (±15%)
+        let variance = base_flow_rate * 0.15;
+        let min_flow = (base_flow_rate - variance).max(0.0);
+        let max_flow = base_flow_rate + variance;
+        let flow_rate = rand::thread_rng().gen_range(min_flow..=max_flow);
         
         // Calculate queue propagation based on density
         let propagation_factor = if density > 70 {
@@ -469,14 +486,82 @@ impl IntersectionController {
             0.0
         };
         
-        // Efficiency is higher when flow is balanced and coordinated
-        let max_theoretical_flow = 120.0; // vehicles per minute per sensor
-        (avg_flow / max_theoretical_flow).min(1.0)
+        // 🚀 ENHANCED: More realistic efficiency calculation
+        // Base efficiency on flow balance and traffic conditions
+        let flow_rates: Vec<f32> = self.vehicle_flow_tracker.flow_rates.values().cloned().collect();
+        
+        if flow_rates.is_empty() {
+            return 0.0;
+        }
+        
+        // Calculate flow variance (lower variance = better coordination)
+        let mean_flow = flow_rates.iter().sum::<f32>() / flow_rates.len() as f32;
+        let variance = flow_rates.iter()
+            .map(|flow| (flow - mean_flow).powi(2))
+            .sum::<f32>() / flow_rates.len() as f32;
+        let std_dev = variance.sqrt();
+        
+        // Normalize standard deviation (lower = more efficient)
+        let coordination_factor = if mean_flow > 0.0 {
+            1.0 - (std_dev / mean_flow).min(0.5) // Cap at 50% penalty
+        } else {
+            0.0
+        };
+        
+        // Calculate base efficiency based on optimal flow ranges
+        let optimal_flow_per_sensor = 60.0; // vehicles per minute (realistic peak)
+        let base_efficiency = if mean_flow <= optimal_flow_per_sensor {
+            mean_flow / optimal_flow_per_sensor // Efficiency increases with flow up to optimal
+        } else {
+            // Efficiency decreases with overcrowding
+            let overcrowding_factor = optimal_flow_per_sensor / mean_flow;
+            overcrowding_factor.max(0.3) // Minimum 30% efficiency even in heavy congestion
+        };
+        
+        // Weather impact on efficiency
+        let weather_efficiency = match self.shared_weather_state.conditions.as_str() {
+            "sunny" | "clear" => 1.0,
+            "partly_cloudy" | "cloudy" => 0.95,
+            "rain" => 0.8,
+            "fog" => 0.7,
+            "snow" => 0.5,
+            _ => 0.9,
+        };
+        
+        // Traffic light coordination efficiency
+        let light_efficiency = match self.traffic_light_cycle.current_phase {
+            TrafficPhase::NorthSouthGreen | TrafficPhase::EastWestGreen => 1.0,
+            TrafficPhase::NorthSouthYellow | TrafficPhase::EastWestYellow => 0.7,
+        };
+        
+        // Combine all efficiency factors
+        let final_efficiency = base_efficiency * coordination_factor * weather_efficiency * light_efficiency;
+        
+        // Ensure efficiency is between 0.0 and 1.0
+        final_efficiency.max(0.0).min(1.0)
     }
     
     fn get_total_intersection_vehicles(&self) -> u16 {
-        // Sum flow rates across all sensors (simplified calculation)
-        self.vehicle_flow_tracker.flow_rates.values().sum::<f32>() as u16 / 12 // Convert back to current count
+        // 🚀 ENHANCED: More realistic total vehicle calculation
+        // Sum actual vehicle counts from flow tracking, not just flow rates
+        let total_flow_per_minute: f32 = self.vehicle_flow_tracker.flow_rates.values().sum();
+        
+        // Convert flow rate (vehicles/minute) to current vehicle count
+        // Assume vehicles stay in intersection area for average 30-60 seconds
+        let avg_stay_time_minutes = 0.75; // 45 seconds average
+        let estimated_vehicles = (total_flow_per_minute * avg_stay_time_minutes) as u16;
+        
+        // Add some realistic variance and minimum values
+        if estimated_vehicles == 0 && !self.vehicle_flow_tracker.flow_rates.is_empty() {
+            // Always have at least a few vehicles if there's any flow
+            rand::thread_rng().gen_range(1..5)
+        } else {
+            // Add ±20% variance for realism
+            let variance = (estimated_vehicles as f32 * 0.2) as u16;
+            let min_vehicles = estimated_vehicles.saturating_sub(variance);
+            let max_vehicles = estimated_vehicles + variance;
+            rand::thread_rng().gen_range(min_vehicles..=max_vehicles.max(min_vehicles + 1))
+        }
     }
 }
 
@@ -1480,11 +1565,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut sim = sim_clone.lock().await;
                 let mut controller = controller_clone.lock().await;
                 
-                // Update controller with current sensor data before generating traffic data
+                // 🚀 ENHANCED: Dynamic flow calculation based on realistic traffic patterns
                 let sensor_id = sim.sensor_id.clone();
-                let density = 50; // This would normally be calculated from current data
-                let vehicle_count = 10; // This would normally be from actual vehicle data
-                controller.update_vehicle_flow(&sensor_id, vehicle_count, density);
+                
+                // Calculate realistic density based on time of day and random factors
+                let hour = chrono::Utc::now().hour();
+                let base_density = match hour {
+                    6..=9 => sim.rng.gen_range(60..90),   // Morning rush: high density
+                    10..=15 => sim.rng.gen_range(30..60), // Daytime: medium density
+                    16..=19 => sim.rng.gen_range(70..95), // Evening rush: highest density
+                    20..=23 => sim.rng.gen_range(20..45), // Evening: low-medium density
+                    _ => sim.rng.gen_range(5..25),        // Night: very low density
+                };
+                
+                // Calculate realistic vehicle count based on density and sensor direction
+                let direction_factor = match sim.sensor_direction.as_str() {
+                    "north" | "south" => 1.0,  // Main traffic flow
+                    "east" | "west" => 0.8,    // Cross traffic typically lower
+                    _ => 0.9,
+                };
+                
+                // Vehicle count correlates with density but has realistic variance
+                let base_vehicles = (base_density as f32 * direction_factor * 0.3) as u16; // Scale factor for realism
+                let vehicle_count = base_vehicles + sim.rng.gen_range(0..15); // Add variance
+                
+                // Weather impact on vehicle count and density
+                let weather_factor = match controller.shared_weather_state.conditions.as_str() {
+                    "rain" | "fog" => 0.8,  // 20% reduction in flow due to slower speeds
+                    "snow" => 0.6,          // 40% reduction in severe weather
+                    "sunny" | "clear" => 1.1, // 10% increase in good weather
+                    _ => 1.0,               // Normal conditions
+                };
+                
+                let adjusted_density = (base_density as f32 * weather_factor) as u16;
+                let adjusted_vehicle_count = (vehicle_count as f32 * weather_factor) as u16;
+                
+                // Traffic light impact on flow
+                let light_phase = controller.get_light_status_for_sensor(&sim.sensor_direction);
+                let light_factor = match light_phase.as_str() {
+                    "green" => 1.0,
+                    "yellow" => 0.7,  // Reduced flow during yellow
+                    "red" => 0.2,     // Minimal flow during red (turning traffic only)
+                    _ => 0.8,
+                };
+                
+                let final_vehicle_count = (adjusted_vehicle_count as f32 * light_factor) as u16;
+                
+                controller.update_vehicle_flow(&sensor_id, final_vehicle_count, adjusted_density);
                 
                 drop(controller); // Release the controller lock
                 
